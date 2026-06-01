@@ -18,6 +18,8 @@ pub const Cpu = struct {
     delay: u8 = 0,
     sound: u8 = 0,
     rng: std.Random.DefaultPrng = undefined,
+    /// Non-null while waiting for 0xFX0A (LD Vx, K). Holds destination register index.
+    waiting_for_key: ?u8 = null,
 
     pub fn init() Cpu {
         var cpu = Cpu{};
@@ -39,8 +41,30 @@ pub const Cpu = struct {
     }
 
     pub fn tick(self: *Cpu, mem: *Memory, display: *Display, input: *Input) CpuError!void {
+        // Don't execute while blocked on a key — main loop must call resolveKey first.
+        if (self.waiting_for_key != null) return;
         const op = self.fetch(mem);
         try self.execute(op, mem, display, input);
+    }
+
+    /// Called by the main loop when a key is pressed. Unblocks 0xFX0A.
+    pub fn resolveKey(self: *Cpu, key: u4) void {
+        if (self.waiting_for_key) |reg| {
+            self.v[reg] = @intCast(key);
+            self.waiting_for_key = null;
+        }
+    }
+
+    /// Reset CPU to initial state, keeping the loaded ROM in memory.
+    pub fn reset(self: *Cpu) void {
+        self.v = [_]u8{0} ** 16;
+        self.i = 0;
+        self.pc = 0x200;
+        self.sp = 0;
+        self.stack = [_]u16{0} ** 16;
+        self.delay = 0;
+        self.sound = 0;
+        self.waiting_for_key = null;
     }
 
     pub fn tickTimers(self: *Cpu) void {
@@ -103,7 +127,7 @@ pub const Cpu = struct {
                 },
                 else => return CpuError.UnknownOpcode,
             },
-            0xF000 => try self.executeF(kk, x, n, mem, input),
+            0xF000 => try self.executeF(kk, x, mem, input),
             else => return CpuError.UnknownOpcode,
         }
     }
@@ -139,11 +163,14 @@ pub const Cpu = struct {
         }
     }
 
-    fn executeF(self: *Cpu, kk: u8, x: u8, _n: u8, mem: *Memory, input: *Input) CpuError!void {
-        _ = _n;
+    fn executeF(self: *Cpu, kk: u8, x: u8, mem: *Memory, _input: *Input) CpuError!void {
+        _ = _input;
         switch (kk) {
             0x07 => self.v[x] = self.delay,
-            0x0A => self.v[x] = input.waitForKey(),
+            0x0A => {
+                self.pc -= 2; // re-point to this instruction until a key arrives
+                self.waiting_for_key = x;
+            },
             0x15 => self.delay = self.v[x],
             0x18 => self.sound = self.v[x],
             0x1E => self.i +%= self.v[x],
@@ -344,4 +371,35 @@ test "0xFX55/0xFX65 store and load registers" {
     try std.testing.expectEqual(@as(u8, 0xAA), cpu.v[0]);
     try std.testing.expectEqual(@as(u8, 0xBB), cpu.v[1]);
     try std.testing.expectEqual(@as(u8, 0xCC), cpu.v[2]);
+}
+
+test "0xFX0A waitForKey — blocks until resolveKey called" {
+    var cpu = Cpu.init();
+    var mem = Memory.init();
+    var disp = Display.init();
+    var inp = Input.init();
+
+    // Encode LD V3, K at 0x200
+    mem.ram[0x200] = 0xF3;
+    mem.ram[0x201] = 0x0A;
+
+    // First tick: CPU sets waiting_for_key and rewinds PC, doesn't advance
+    try cpu.tick(&mem, &disp, &inp);
+    try std.testing.expectEqual(@as(?u8, 3), cpu.waiting_for_key);
+    try std.testing.expectEqual(@as(u16, 0x200), cpu.pc); // rewound
+
+    // Second tick while still waiting: no-op
+    try cpu.tick(&mem, &disp, &inp);
+    try std.testing.expectEqual(@as(u16, 0x200), cpu.pc);
+
+    // Key arrives: resolveKey unblocks
+    cpu.resolveKey(0x7);
+    try std.testing.expectEqual(@as(?u8, null), cpu.waiting_for_key);
+    try std.testing.expectEqual(@as(u8, 0x7), cpu.v[3]);
+
+    // Next tick executes normally (past the LD Vx,K instruction)
+    mem.ram[0x200] = 0x00; // NOP (SYS — ignored)
+    mem.ram[0x201] = 0x00;
+    try cpu.tick(&mem, &disp, &inp);
+    try std.testing.expectEqual(@as(u16, 0x202), cpu.pc);
 }

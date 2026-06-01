@@ -10,9 +10,10 @@ const Audio = @import("audio.zig").Audio;
 
 const WINDOW_W = display_mod.WIDTH * display_mod.SCALE;
 const WINDOW_H = display_mod.HEIGHT * display_mod.SCALE;
+const MS_PER_FRAME: u32 = 16; // ~60 Hz
 
 // SDL scancode → CHIP-8 hex key
-// Keyboard layout:
+// Layout:
 //   1 2 3 4  →  1 2 3 C
 //   Q W E R  →  4 5 6 D
 //   A S D F  →  7 8 9 E
@@ -38,22 +39,48 @@ const key_map = blk: {
     break :blk m;
 };
 
+fn romBasename(path: []const u8) []const u8 {
+    var i = path.len;
+    while (i > 0) {
+        i -= 1;
+        if (path[i] == '/' or path[i] == '\\') return path[i + 1 ..];
+    }
+    return path;
+}
+
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.gpa);
     defer init.gpa.free(args);
 
-    if (args.len < 2) {
-        std.debug.print("Usage: chip8_zig <rom.ch8>\n", .{});
+    // Parse args: chip8_zig [--cycles N] <rom.ch8>
+    var cycles_per_frame: usize = 10;
+    var rom_path: ?[]const u8 = null;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--cycles") and i + 1 < args.len) {
+            i += 1;
+            cycles_per_frame = std.fmt.parseInt(usize, args[i], 10) catch {
+                std.debug.print("Invalid --cycles value: {s}\n", .{args[i]});
+                return;
+            };
+        } else {
+            rom_path = args[i];
+        }
+    }
+
+    if (rom_path == null) {
+        std.debug.print("Usage: chip8_zig [--cycles N] <rom.ch8>\n", .{});
+        std.debug.print("  --cycles N   CPU cycles per frame (default: 10, ~600Hz)\n", .{});
         return;
     }
 
     const rom_data = std.Io.Dir.cwd().readFileAlloc(
         init.io,
-        args[1],
+        rom_path.?,
         init.gpa,
         std.Io.Limit.limited(3584),
     ) catch |err| {
-        std.debug.print("Failed to read ROM '{s}': {}\n", .{ args[1], err });
+        std.debug.print("Failed to read ROM '{s}': {}\n", .{ rom_path.?, err });
         return;
     };
     defer init.gpa.free(rom_data);
@@ -64,8 +91,12 @@ pub fn main(init: std.process.Init) !void {
     }
     defer sdl.SDL_Quit();
 
+    // Build window title: "CHIP-8 — <romname>"
+    var title_buf: [128]u8 = undefined;
+    const title = std.fmt.bufPrintZ(&title_buf, "CHIP-8 — {s}", .{romBasename(rom_path.?)}) catch "CHIP-8";
+
     const window = sdl.SDL_CreateWindow(
-        "CHIP-8",
+        title.ptr,
         sdl.SDL_WINDOWPOS_CENTERED,
         sdl.SDL_WINDOWPOS_CENTERED,
         WINDOW_W,
@@ -100,22 +131,47 @@ pub fn main(init: std.process.Init) !void {
     var display = Display.init();
     var input = Input.init();
 
-    const CYCLES_PER_FRAME = 10; // ~600Hz at 60fps
-    const MS_PER_FRAME: u32 = 16; // ~60Hz
-
+    var paused = false;
     var running = true;
+
     while (running) {
         const frame_start = sdl.SDL_GetTicks64();
 
+        // --- Event processing ---
         var event: sdl.SDL_Event = undefined;
         while (sdl.SDL_PollEvent(&event) != 0) {
             switch (event.type) {
                 sdl.SDL_QUIT => running = false,
                 sdl.SDL_KEYDOWN => {
-                    if (event.key.keysym.scancode == sdl.SDL_SCANCODE_ESCAPE) running = false;
-                    const sc: usize = @intCast(event.key.keysym.scancode);
-                    if (sc < key_map.len) {
-                        if (key_map[sc]) |k| input.setKey(k, true);
+                    const sc = event.key.keysym.scancode;
+                    switch (sc) {
+                        sdl.SDL_SCANCODE_ESCAPE => running = false,
+                        sdl.SDL_SCANCODE_P => {
+                            paused = !paused;
+                            const suffix = if (paused) " [PAUSED]" else "";
+                            var pb: [128]u8 = undefined;
+                            const pt = std.fmt.bufPrintZ(&pb, "CHIP-8 — {s}{s}", .{ romBasename(rom_path.?), suffix }) catch title;
+                            sdl.SDL_SetWindowTitle(window, pt.ptr);
+                        },
+                        sdl.SDL_SCANCODE_F5 => {
+                            // Reset: reload ROM and restart CPU + display
+                            cpu.reset();
+                            display.clear();
+                            mem = Memory.init();
+                            mem.load(rom_data) catch {};
+                            paused = false;
+                            sdl.SDL_SetWindowTitle(window, title.ptr);
+                        },
+                        else => {
+                            const sc_idx: usize = @intCast(sc);
+                            if (sc_idx < key_map.len) {
+                                if (key_map[sc_idx]) |k| {
+                                    input.setKey(k, true);
+                                    // Resolve LD Vx, K if CPU is waiting
+                                    if (cpu.waiting_for_key != null) cpu.resolveKey(k);
+                                }
+                            }
+                        },
                     }
                 },
                 sdl.SDL_KEYUP => {
@@ -128,18 +184,24 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        for (0..CYCLES_PER_FRAME) |_| {
-            cpu.tick(&mem, &display, &input) catch |err| {
-                std.debug.print("CPU error: {}\n", .{err});
-                running = false;
-                break;
-            };
+        if (!paused) {
+            // --- CPU execution ---
+            for (0..cycles_per_frame) |_| {
+                cpu.tick(&mem, &display, &input) catch |err| {
+                    std.debug.print("CPU error: {}\n", .{err});
+                    running = false;
+                    break;
+                };
+            }
+
+            // --- Timer decrement (60 Hz) ---
+            cpu.tickTimers();
+
+            // --- Audio ---
+            if (audio_opt) |*a| a.setBeeping(cpu.sound > 0);
         }
 
-        cpu.tickTimers();
-
-        if (audio_opt) |*a| a.setBeeping(cpu.sound > 0);
-
+        // --- Render ---
         if (display.dirty) {
             display.dirty = false;
             _ = sdl.SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
@@ -161,6 +223,7 @@ pub fn main(init: std.process.Init) !void {
             sdl.SDL_RenderPresent(renderer);
         }
 
+        // --- Frame cap ---
         const elapsed: u32 = @truncate(sdl.SDL_GetTicks64() - frame_start);
         if (elapsed < MS_PER_FRAME) sdl.SDL_Delay(MS_PER_FRAME - elapsed);
     }
