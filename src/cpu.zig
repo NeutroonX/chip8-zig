@@ -17,9 +17,18 @@ pub const Cpu = struct {
     stack: [16]u16 = [_]u16{0} ** 16,
     delay: u8 = 0,
     sound: u8 = 0,
+    rng: std.Random.DefaultPrng = undefined,
 
     pub fn init() Cpu {
-        return .{};
+        var cpu = Cpu{};
+        cpu.rng = std.Random.DefaultPrng.init(0xDEADBEEF);
+        return cpu;
+    }
+
+    pub fn initSeeded(seed: u64) Cpu {
+        var cpu = Cpu{};
+        cpu.rng = std.Random.DefaultPrng.init(seed);
+        return cpu;
     }
 
     pub fn fetch(self: *Cpu, mem: *const Memory) u16 {
@@ -80,16 +89,16 @@ pub const Cpu = struct {
             },
             0xA000 => self.i = nnn,
             0xB000 => self.pc = nnn + self.v[0],
-            0xC000 => self.v[x] = std.crypto.random.int(u8) & kk,
+            0xC000 => self.v[x] = self.rng.random().int(u8) & kk,
             0xD000 => {
                 const sprite = mem.ram[self.i .. self.i + n];
                 self.v[0xF] = if (display.draw(self.v[x], self.v[y], sprite)) 1 else 0;
             },
             0xE000 => switch (kk) {
-                0x9E => if (input.isPressed(self.v[x] & 0xF)) {
+                0x9E => if (input.isPressed(@truncate(self.v[x] & 0xF))) {
                     self.pc += 2;
                 },
-                0xA1 => if (!input.isPressed(self.v[x] & 0xF)) {
+                0xA1 => if (!input.isPressed(@truncate(self.v[x] & 0xF))) {
                     self.pc += 2;
                 },
                 else => return CpuError.UnknownOpcode,
@@ -191,4 +200,148 @@ test "timers stop at zero" {
     cpu.delay = 0;
     cpu.tickTimers();
     try std.testing.expectEqual(@as(u8, 0), cpu.delay);
+}
+
+// Helper: run one opcode encoded directly in memory
+fn runOp(cpu: *Cpu, mem: *Memory, disp: *Display, inp: *Input, hi: u8, lo: u8) !void {
+    mem.ram[cpu.pc] = hi;
+    mem.ram[cpu.pc + 1] = lo;
+    try cpu.tick(mem, disp, inp);
+}
+
+test "0x00E0 clear display" {
+    var cpu = Cpu.init();
+    var mem = Memory.init();
+    var disp = Display.init();
+    var inp = Input.init();
+    disp.framebuffer[0] = true;
+    try runOp(&cpu, &mem, &disp, &inp, 0x00, 0xE0);
+    try std.testing.expectEqual(false, disp.framebuffer[0]);
+}
+
+test "0x1NNN jump" {
+    var cpu = Cpu.init();
+    var mem = Memory.init();
+    var disp = Display.init();
+    var inp = Input.init();
+    try runOp(&cpu, &mem, &disp, &inp, 0x12, 0x34);
+    try std.testing.expectEqual(@as(u16, 0x234), cpu.pc);
+}
+
+test "0x2/0xEE call and return" {
+    var cpu = Cpu.init();
+    var mem = Memory.init();
+    var disp = Display.init();
+    var inp = Input.init();
+    // CALL 0x300
+    try runOp(&cpu, &mem, &disp, &inp, 0x23, 0x00);
+    try std.testing.expectEqual(@as(u16, 0x300), cpu.pc);
+    try std.testing.expectEqual(@as(u8, 1), cpu.sp);
+    // Place RET at 0x300
+    try runOp(&cpu, &mem, &disp, &inp, 0x00, 0xEE);
+    try std.testing.expectEqual(@as(u16, 0x202), cpu.pc);
+    try std.testing.expectEqual(@as(u8, 0), cpu.sp);
+}
+
+test "0x6XKK LD Vx" {
+    var cpu = Cpu.init();
+    var mem = Memory.init();
+    var disp = Display.init();
+    var inp = Input.init();
+    try runOp(&cpu, &mem, &disp, &inp, 0x60, 0xAB);
+    try std.testing.expectEqual(@as(u8, 0xAB), cpu.v[0]);
+}
+
+test "0x7XKK ADD Vx, byte" {
+    var cpu = Cpu.init();
+    var mem = Memory.init();
+    var disp = Display.init();
+    var inp = Input.init();
+    cpu.v[1] = 0x10;
+    try runOp(&cpu, &mem, &disp, &inp, 0x71, 0x05);
+    try std.testing.expectEqual(@as(u8, 0x15), cpu.v[1]);
+}
+
+test "0x8XY4 ADD with carry" {
+    var cpu = Cpu.init();
+    var mem = Memory.init();
+    var disp = Display.init();
+    var inp = Input.init();
+    cpu.v[0] = 0xFF;
+    cpu.v[1] = 0x01;
+    try runOp(&cpu, &mem, &disp, &inp, 0x80, 0x14);
+    try std.testing.expectEqual(@as(u8, 0x00), cpu.v[0]);
+    try std.testing.expectEqual(@as(u8, 1), cpu.v[0xF]); // carry
+}
+
+test "0x8XY5 SUB with borrow" {
+    var cpu = Cpu.init();
+    var mem = Memory.init();
+    var disp = Display.init();
+    var inp = Input.init();
+    cpu.v[0] = 0x05;
+    cpu.v[1] = 0x03;
+    try runOp(&cpu, &mem, &disp, &inp, 0x80, 0x15);
+    try std.testing.expectEqual(@as(u8, 0x02), cpu.v[0]);
+    try std.testing.expectEqual(@as(u8, 1), cpu.v[0xF]); // no borrow
+}
+
+test "0xANNN LD I" {
+    var cpu = Cpu.init();
+    var mem = Memory.init();
+    var disp = Display.init();
+    var inp = Input.init();
+    try runOp(&cpu, &mem, &disp, &inp, 0xA1, 0x23);
+    try std.testing.expectEqual(@as(u16, 0x123), cpu.i);
+}
+
+test "0xDXYN draw sprite with collision" {
+    var cpu = Cpu.init();
+    var mem = Memory.init();
+    var disp = Display.init();
+    var inp = Input.init();
+    // place 1-byte sprite at 0x300
+    mem.ram[0x300] = 0x80; // leftmost pixel only
+    cpu.i = 0x300;
+    cpu.v[0] = 0;
+    cpu.v[1] = 0;
+    // draw once - no collision
+    try runOp(&cpu, &mem, &disp, &inp, 0xD0, 0x11);
+    try std.testing.expectEqual(@as(u8, 0), cpu.v[0xF]);
+    // draw again - collision
+    try runOp(&cpu, &mem, &disp, &inp, 0xD0, 0x11);
+    try std.testing.expectEqual(@as(u8, 1), cpu.v[0xF]);
+}
+
+test "0xFX33 BCD" {
+    var cpu = Cpu.init();
+    var mem = Memory.init();
+    var disp = Display.init();
+    var inp = Input.init();
+    cpu.v[0] = 123;
+    cpu.i = 0x300;
+    try runOp(&cpu, &mem, &disp, &inp, 0xF0, 0x33);
+    try std.testing.expectEqual(@as(u8, 1), mem.ram[0x300]);
+    try std.testing.expectEqual(@as(u8, 2), mem.ram[0x301]);
+    try std.testing.expectEqual(@as(u8, 3), mem.ram[0x302]);
+}
+
+test "0xFX55/0xFX65 store and load registers" {
+    var cpu = Cpu.init();
+    var mem = Memory.init();
+    var disp = Display.init();
+    var inp = Input.init();
+    cpu.v[0] = 0xAA;
+    cpu.v[1] = 0xBB;
+    cpu.v[2] = 0xCC;
+    cpu.i = 0x300;
+    try runOp(&cpu, &mem, &disp, &inp, 0xF2, 0x55); // store V0..V2
+    cpu.v[0] = 0;
+    cpu.v[1] = 0;
+    cpu.v[2] = 0;
+    cpu.i = 0x300;
+    try runOp(&cpu, &mem, &disp, &inp, 0xF2, 0x65); // load V0..V2
+    try std.testing.expectEqual(@as(u8, 0xAA), cpu.v[0]);
+    try std.testing.expectEqual(@as(u8, 0xBB), cpu.v[1]);
+    try std.testing.expectEqual(@as(u8, 0xCC), cpu.v[2]);
 }
