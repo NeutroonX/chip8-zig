@@ -3,5 +3,3 @@ zig-cache/
 .zig-cache/
 *.o
 *.rom
-*.ch8
-roms/
