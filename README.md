@@ -98,7 +98,7 @@ brew install sdl2
 Clone the repository and build with the Zig build system:
 
 ```sh
-git clone <your-repo-url>
+git clone <https://github.com/NeutroonX/chip8-zig.git>
 cd chip8-zig
 zig build
 ```
